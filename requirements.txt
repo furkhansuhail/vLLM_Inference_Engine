@@ -1,0 +1,11 @@
+# Server-side dependencies for the vLLM inference engine.
+# Install with:  pip install -r requirements.txt
+#
+# vLLM pulls in: torch (with CUDA), transformers, tokenizers, fastapi, uvicorn,
+# huggingface_hub, pydantic, and a long tail of compiled kernels (flashinfer,
+# xformers, etc.). Listing fastapi and uvicorn explicitly here so the project's
+# direct dependencies are visible — they're transitively required by vllm too.
+
+vllm>=0.20.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0

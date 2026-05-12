@@ -1,0 +1,19 @@
+distributed-vllm-demo/
+├── server/                  ← opens as a PyCharm project on CentOS
+│   ├── prefetch_models.py
+│   ├── smoke_test.py
+│   ├── server.py
+│   ├── requirements.txt
+│   └── README.md
+├── client/                  ← opens as a PyCharm project on Windows
+│   ├── telemetry_cli.py
+│   ├── streamlit_app.py
+│   ├── shared/
+│   │   └── protocol.py      ← request/response Pydantic models
+│   ├── requirements.txt
+│   └── README.md
+├── setup/
+│   └── prefetch_models.py
+├── docs/
+│   └── architecture.md
+└── README.md
