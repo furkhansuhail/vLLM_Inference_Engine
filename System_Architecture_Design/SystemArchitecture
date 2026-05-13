@@ -17,3 +17,16 @@ distributed-vllm-demo/
 ├── docs/
 │   └── architecture.md
 └── README.md
+
+
+Kill vLLM and free memory in GPU
+
+# See vLLM-related Python processes
+ps -ef | grep -E "server\.py|EngineCore|vllm" | grep -v grep
+
+# Nuclear option if you're confident no other workload is on the 3080:
+pkill -9 -f "server.py"
+pkill -9 -f "EngineCore"
+
+# Verify GPU is empty again
+nvidia-smi

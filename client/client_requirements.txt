@@ -1,0 +1,13 @@
+# Client-side dependencies (Windows machine).
+# Install in a fresh venv:
+#   python -m venv .venv
+#   .venv\Scripts\activate
+#   pip install -r requirements.txt
+#
+# These are intentionally minimal — no torch, no vllm. The client speaks
+# HTTP to the CentOS server and renders the results.
+
+streamlit>=1.32.0
+httpx>=0.27.0
+pandas>=2.0.0
+plotly>=5.18.0
