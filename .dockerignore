@@ -1,0 +1,47 @@
+# .dockerignore — placed in the project ROOT (not in docker/).
+#
+# Excludes files from the Docker build context that aren't needed in
+# the image. Keeping the context lean speeds up `docker build` and
+# avoids accidentally baking secrets / large unrelated files into
+# image layers.
+
+# Python build artefacts
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.pytest_cache/
+
+# Local venvs — must NEVER be copied in; the image creates its own
+# at /opt/venv with a fresh pip install.
+.venv/
+venv/
+env/
+
+# IDE / editor cruft
+.idea/
+.vscode/
+*.swp
+
+# Version control
+.git/
+.gitignore
+
+# Logs / runtime files
+*.log
+server.env
+
+# Project areas not needed in the server image
+client/                       # client lives on Windows; not in the container
+System_Architecture_Design/   # design docs
+setup/                        # host-side hardware sanity checks
+systemd/                      # alternative deployment path
+
+# Markdown / docs at root
+README.md
+*.md
+# Note: docker/README.md IS still needed in the build context if you
+# COPY it into the image. Currently we don't, so excluding *.md is fine.
+
+# Docker artefacts themselves — referenced via COPY but not bulk-copied
+.dockerignore

@@ -1,0 +1,47 @@
+[Unit]
+Description=vLLM Inference Server (FastAPI + SSE on RTX 3080)
+Documentation=file:///%h/Desktop/Pycharm_Projects/vLLM_Inference_Engine/systemd/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Desktop/Pycharm_Projects/vLLM_Inference_Engine
+
+# Preflight runs before each (re)start: kills orphans, checks VRAM.
+# It exits 0 even on warnings, so a low-VRAM situation doesn't prevent
+# the service from trying — the real exec will error cleanly if it
+# really can't start, and Restart=on-failure will try again after 5s
+# of additional VRAM drain time.
+ExecStartPre=%h/Desktop/Pycharm_Projects/vLLM_Inference_Engine/systemd/preflight.sh
+
+ExecStart=%h/Desktop/Pycharm_Projects/vLLM_Inference_Engine/systemd/server-wrapper.sh
+
+# Crash recovery. RestartSec=5 gives the GPU time to release VRAM
+# between crashed-EngineCore and next start (the orphan-VRAM bug we
+# hit earlier needed ~3-5s after kill before VRAM showed as free).
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Clean shutdown. KillMode=mixed sends SIGTERM to the main python
+# process (which propagates to EngineCore subprocess) then SIGKILL to
+# everything in the cgroup after TimeoutStopSec.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Logging to journal — journalctl --user -u vllm-server -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vllm-server
+
+# Boot-time model selection.
+#  Default: qwen.
+#  Override by writing `VLLM_DEFAULT_MODEL=mistral` into server.env.
+Environment="VLLM_DEFAULT_MODEL=qwen"
+EnvironmentFile=-%h/Desktop/Pycharm_Projects/vLLM_Inference_Engine/server.env
+
+[Install]
+WantedBy=default.target
