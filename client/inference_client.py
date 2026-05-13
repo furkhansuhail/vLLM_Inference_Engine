@@ -8,10 +8,12 @@ Every relevant timestamp is captured (submit, first byte, first token,
 each token, complete), so TTFT, ITL, and throughput fall out of the
 StreamResult dataclass without extra bookkeeping.
 
-Also provides `poll_metrics()` — a cancellable loop that hits /metrics on
-a fixed interval and accumulates timestamped snapshots, used by the
-dashboard to capture mid-batch scheduler state instead of just the
-post-batch snapshot.
+Also provides:
+  * `poll_metrics()`     — cancellable /metrics polling loop, used by
+                           the dashboard to capture mid-batch scheduler state.
+  * `RetryConfig`        — configures the connection-phase retry behaviour
+                           of stream_generate().
+  * `load_model()`       — request a server-side model swap.
 """
 
 from __future__ import annotations
@@ -36,6 +38,27 @@ class TokenEvent:
     token_count: int          # server-reported cumulative count
 
 
+@dataclass(frozen=True)
+class RetryConfig:
+    """Configures connection-phase retry behaviour for stream_generate().
+
+    Only the *initial connection phase* is retried — failures after the
+    first byte has arrived (mid-stream drops, stalls) are surfaced as
+    errors rather than retried, because the server discards the
+    in-flight generation when our TCP connection drops, and a fresh
+    attempt would silently lose the partial tokens we already showed
+    the user.
+    """
+    max_attempts: int = 3
+    backoff_initial: float = 0.5
+    backoff_factor: float = 2.0
+    retry_on_status: tuple[int, ...] = (502, 503, 504)
+
+    def __post_init__(self):
+        if self.max_attempts < 1:
+            raise ValueError(f"max_attempts must be >= 1, got {self.max_attempts}")
+
+
 @dataclass
 class StreamResult:
     """Accumulated result of a single streamed request."""
@@ -43,35 +66,32 @@ class StreamResult:
     prompt: str
     case: str
 
-    # Timing — all client-side wall clocks, seconds since epoch.
     submitted_at: float = 0.0
-    first_byte_at: Optional[float] = None    # first SSE event of any kind
-    first_token_at: Optional[float] = None   # first 'token' event specifically
+    first_byte_at: Optional[float] = None
+    first_token_at: Optional[float] = None
     completed_at: Optional[float] = None
 
-    # Content
     tokens: list[TokenEvent] = field(default_factory=list)
     text: str = ""
     total_tokens: int = 0
     finish_reason: Optional[str] = None
 
-    # From server metadata event
     server_received_at: Optional[float] = None
     model_key: Optional[str] = None
 
-    # Error from network or server-side
+    attempts: int = 1
+    attempt_errors: list[str] = field(default_factory=list)
+
     error: Optional[str] = None
 
     @property
     def ttft_ms(self) -> Optional[float]:
-        """Time to first token, in milliseconds."""
         if self.first_token_at is None:
             return None
         return (self.first_token_at - self.submitted_at) * 1000.0
 
     @property
     def duration_seconds(self) -> Optional[float]:
-        """Submit-to-complete wall clock duration."""
         if self.completed_at is None:
             return None
         return self.completed_at - self.submitted_at
@@ -85,7 +105,6 @@ class StreamResult:
 
     @property
     def inter_token_latencies_ms(self) -> list[float]:
-        """List of gaps between consecutive token arrivals, in ms."""
         if len(self.tokens) < 2:
             return []
         return [
@@ -96,12 +115,7 @@ class StreamResult:
 
 @dataclass
 class MetricsSnapshot:
-    """One poll of /metrics with a client wall-clock timestamp.
-
-    Only populated when the server's `scheduler` block has real numbers
-    (not the idle placeholder or an error). Mirrors the keys the V1 stat
-    logger exposes; raw payload kept for debug.
-    """
+    """One poll of /metrics with a client wall-clock timestamp."""
     timestamp: float
     num_running: int = 0
     num_waiting: int = 0
@@ -115,6 +129,49 @@ class MetricsSnapshot:
 
 # ---- Streaming inference call ---------------------------------------------
 
+async def _consume_sse(
+    response: httpx.Response,
+    result: StreamResult,
+    on_token: Optional[Callable[[StreamResult], None]],
+) -> str:
+    """Drain SSE events. Returns 'done' / 'error' / 'closed'."""
+    async for line in response.aiter_lines():
+        if not line.startswith("data: "):
+            continue
+        if result.first_byte_at is None:
+            result.first_byte_at = time.time()
+        try:
+            event = json.loads(line[len("data: "):])
+        except json.JSONDecodeError:
+            continue
+        event_type = event.get("type")
+        if event_type == "metadata":
+            result.server_received_at = event.get("server_received_at")
+            result.model_key = event.get("model_key")
+        elif event_type == "token":
+            now = time.time()
+            if result.first_token_at is None:
+                result.first_token_at = now
+            text = event.get("text", "")
+            result.text += text
+            result.tokens.append(TokenEvent(
+                timestamp=now, text=text,
+                token_count=event.get("token_count", 0),
+            ))
+            if on_token is not None:
+                on_token(result)
+        elif event_type == "done":
+            result.completed_at = time.time()
+            result.total_tokens = event.get("total_tokens", 0)
+            result.finish_reason = event.get("finish_reason")
+            return "done"
+        elif event_type == "error":
+            result.error = event.get("message", "unknown server error")
+            result.completed_at = time.time()
+            return "error"
+    return "closed"
+
+
 async def stream_generate(
     client: httpx.AsyncClient,
     server_url: str,
@@ -126,15 +183,21 @@ async def stream_generate(
     top_p: float = 0.9,
     request_id: Optional[str] = None,
     on_token: Optional[Callable[[StreamResult], None]] = None,
+    retry: Optional[RetryConfig] = None,
 ) -> StreamResult:
     """Submit one prompt and consume the SSE stream end-to-end.
 
-    `on_token` is invoked after each 'token' event with the in-progress
-    result; the Streamlit UI uses this to update its live token displays.
+    Retries connection-phase failures up to retry.max_attempts. See
+    RetryConfig docstring for what counts as retryable. Mid-stream
+    failures (after first_byte_at is set) are surfaced rather than
+    retried because the server discards the in-flight generation on
+    disconnect.
     """
+    if retry is None:
+        retry = RetryConfig()
+
     rid = request_id or str(uuid.uuid4())
     result = StreamResult(request_id=rid, prompt=prompt, case=case)
-
     payload = {
         "prompt": prompt,
         "max_tokens": max_tokens,
@@ -144,65 +207,78 @@ async def stream_generate(
     }
 
     result.submitted_at = time.time()
+    timeouts = httpx.Timeout(300.0, connect=5.0, read=30.0)
 
-    try:
-        async with client.stream(
-            "POST",
-            f"{server_url}/v1/generate",
-            json=payload,
-            timeout=httpx.Timeout(180.0, connect=10.0),
-        ) as response:
-            response.raise_for_status()
+    for attempt in range(1, retry.max_attempts + 1):
+        result.attempts = attempt
+        attempt_err: Optional[str] = None
 
-            async for line in response.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
+        try:
+            async with client.stream(
+                "POST",
+                f"{server_url}/v1/generate",
+                json=payload,
+                timeout=timeouts,
+            ) as response:
+                if response.status_code in retry.retry_on_status:
+                    try:
+                        body = (await response.aread()).decode("utf-8", "replace")[:200]
+                    except Exception:
+                        body = ""
+                    attempt_err = (
+                        f"HTTP {response.status_code}"
+                        + (f": {body.strip()}" if body.strip() else "")
+                    )
+                else:
+                    response.raise_for_status()
+                    terminal = await _consume_sse(response, result, on_token)
+                    if terminal in ("done", "error"):
+                        return result
+                    if result.first_byte_at is not None:
+                        result.error = "stream closed without 'done' or 'error' event"
+                        result.completed_at = time.time()
+                        return result
+                    attempt_err = "server closed empty stream"
 
-                if result.first_byte_at is None:
-                    result.first_byte_at = time.time()
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            attempt_err = f"{type(e).__name__}: {e}"
 
-                try:
-                    event = json.loads(line[len("data: "):])
-                except json.JSONDecodeError:
-                    continue
+        except httpx.ReadTimeout as e:
+            if result.first_byte_at is not None:
+                result.error = f"stream stalled (no data for >30s): {e}"
+                result.completed_at = time.time()
+                return result
+            attempt_err = f"ReadTimeout: {e}"
 
-                event_type = event.get("type")
+        except httpx.RemoteProtocolError as e:
+            if result.first_byte_at is not None:
+                result.error = f"stream dropped mid-flight: {e}"
+                result.completed_at = time.time()
+                return result
+            attempt_err = f"RemoteProtocolError: {e}"
 
-                if event_type == "metadata":
-                    result.server_received_at = event.get("server_received_at")
-                    result.model_key = event.get("model_key")
+        except httpx.HTTPStatusError as e:
+            result.error = f"HTTP {e.response.status_code}: {e}"
+            result.completed_at = time.time()
+            return result
 
-                elif event_type == "token":
-                    now = time.time()
-                    if result.first_token_at is None:
-                        result.first_token_at = now
-                    text = event.get("text", "")
-                    result.text += text
-                    result.tokens.append(TokenEvent(
-                        timestamp=now,
-                        text=text,
-                        token_count=event.get("token_count", 0),
-                    ))
-                    if on_token is not None:
-                        on_token(result)
+        except Exception as e:
+            result.error = f"{type(e).__name__}: {e}"
+            result.completed_at = time.time()
+            return result
 
-                elif event_type == "done":
-                    result.completed_at = time.time()
-                    result.total_tokens = event.get("total_tokens", 0)
-                    result.finish_reason = event.get("finish_reason")
-                    return result
+        if attempt_err is not None:
+            result.attempt_errors.append(f"attempt {attempt}: {attempt_err}")
 
-                elif event_type == "error":
-                    result.error = event.get("message", "unknown server error")
-                    result.completed_at = time.time()
-                    return result
-
-    except httpx.HTTPError as e:
-        result.error = f"{type(e).__name__}: {e}"
-        result.completed_at = time.time()
-    except Exception as e:
-        result.error = f"{type(e).__name__}: {e}"
-        result.completed_at = time.time()
+        if attempt < retry.max_attempts:
+            backoff = retry.backoff_initial * (retry.backoff_factor ** (attempt - 1))
+            await asyncio.sleep(backoff)
+        else:
+            result.error = (
+                f"failed after {attempt} attempts; last error: {attempt_err}"
+            )
+            result.completed_at = time.time()
+            return result
 
     return result
 
@@ -223,6 +299,29 @@ async def get_metrics(server_url: str) -> dict:
         return r.json()
 
 
+# ---- Model swap -----------------------------------------------------------
+
+async def load_model(server_url: str, model_key: str) -> dict:
+    """Request a server-side model swap. Returns the 202 response body.
+
+    The server replies immediately and runs the swap as a background
+    task; poll get_health() until status='ready' and model_key matches
+    to confirm completion. Expect ~30-35s total (3s teardown + ~30s
+    load). If the swap fails, get_health() will show status='failed'
+    with a `swap_error` field describing the failure.
+
+    Raises HTTPStatusError on 4xx/5xx (e.g. 409 if a swap is already in
+    progress, 400 if model_key is unknown).
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.post(
+            f"{server_url}/admin/load_model",
+            json={"model_key": model_key},
+        )
+        r.raise_for_status()
+        return r.json()
+
+
 # ---- Live metrics polling -------------------------------------------------
 
 async def poll_metrics(
@@ -231,21 +330,7 @@ async def poll_metrics(
     interval_seconds: float = 0.2,
     snapshots: Optional[list[MetricsSnapshot]] = None,
 ) -> list[MetricsSnapshot]:
-    """Poll /metrics in a loop and accumulate snapshots until cancelled.
-
-    Designed to run as an asyncio task concurrent with stream_generate()
-    calls. The caller cancels it via task.cancel() when the batch is
-    done. CancelledError is swallowed and the accumulated snapshots are
-    returned; the caller can also observe them in real time via the
-    `snapshots` list it passes in (mutated in place).
-
-    Network errors during a poll are silently skipped — a single failed
-    /metrics request shouldn't kill the polling loop or take down the
-    batch run.
-
-    Interval is drift-resistant: each iteration sleeps for the remainder
-    of the interval after the HTTP round-trip, not a fixed sleep.
-    """
+    """Poll /metrics in a loop and accumulate snapshots until cancelled."""
     if snapshots is None:
         snapshots = []
 
@@ -258,9 +343,6 @@ async def poll_metrics(
                     if r.status_code == 200:
                         data = r.json()
                         sched = data.get("scheduler", {})
-                        # Only record real readings. Skip idle placeholders
-                        # ({"status": "idle..."}) and error envelopes
-                        # ({"error": "..."}).
                         if "num_running_requests" in sched:
                             snapshots.append(MetricsSnapshot(
                                 timestamp=tick_start,
@@ -274,8 +356,6 @@ async def poll_metrics(
                                 raw=data,
                             ))
                 except (httpx.HTTPError, ValueError, KeyError):
-                    # Network blip, malformed JSON, or unexpected shape —
-                    # keep polling.
                     pass
 
                 elapsed = time.time() - tick_start
