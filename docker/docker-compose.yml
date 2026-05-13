@@ -1,0 +1,72 @@
+# Compose file for the vLLM inference server.
+#
+# Usage from the project root:
+#   docker compose -f docker/docker-compose.yml up               # default model (qwen), foreground
+#   docker compose -f docker/docker-compose.yml up -d            # detached
+#   docker compose -f docker/docker-compose.yml logs -f          # follow logs
+#   docker compose -f docker/docker-compose.yml down             # stop and remove
+#
+# Switch model:
+#   VLLM_DEFAULT_MODEL=mistral docker compose -f docker/docker-compose.yml up
+# or write to docker/.env in this directory:
+#   echo "VLLM_DEFAULT_MODEL=mistral" > docker/.env
+#   docker compose -f docker/docker-compose.yml up
+
+services:
+  vllm-server:
+    build:
+      context: ..                     # project root, so server/ is in the build context
+      dockerfile: docker/Dockerfile
+    image: vllm-server:local
+    container_name: vllm-server
+
+    # restart=unless-stopped mirrors systemd's Restart=on-failure. Crashes
+    # auto-recover; explicit `docker compose down` doesn't auto-restart.
+    restart: unless-stopped
+
+    # GPU passthrough. device_ids selects GPU 1 (RTX 3080) on the host by
+    # CUDA index order — match this to your host's nvidia-smi output, since
+    # CUDA_DEVICE_ORDER=PCI_BUS_ID inside the container makes index 1 the
+    # 3080 just like server.py expects natively. Inside the container, this
+    # GPU is renumbered to 0, which is what CUDA_VISIBLE_DEVICES=0 in the
+    # Dockerfile points at.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['1']
+              capabilities: [gpu]
+
+    # vLLM V1 spawns EngineCore as a subprocess and uses shared memory for
+    # IPC. Docker's default /dev/shm is 64 MiB; vLLM needs more. ipc: host
+    # gives access to the host's /dev/shm. Alternative: shm_size: '2gb'.
+    ipc: host
+
+    ports:
+      - "8000:8000"
+
+    # Mount the host's HuggingFace + vLLM caches so:
+    #   1. Pre-downloaded models (Qwen-3B-FP16, Mistral-7B-AWQ) are accessible
+    #      without re-downloading ~11 GB inside the container.
+    #   2. vLLM's CUDA-graph compile cache persists across container restarts
+    #      (saves ~30s of compile time on second+ starts).
+    # Adjust the host paths if your caches live elsewhere.
+    volumes:
+      - ${HOME}/.cache/huggingface:/cache/huggingface
+      - ${HOME}/.cache/vllm:/cache/vllm
+
+    # VLLM_DEFAULT_MODEL pulls from the host shell or docker/.env, falling
+    # back to qwen. The entrypoint reads it and passes --model to server.py.
+    environment:
+      VLLM_DEFAULT_MODEL: ${VLLM_DEFAULT_MODEL:-qwen}
+
+    # Healthcheck — Docker considers the container healthy once /health
+    # returns 200. Useful for orchestration; doesn't affect anything in
+    # single-container mode but doesn't hurt.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
