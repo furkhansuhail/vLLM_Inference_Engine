@@ -8,7 +8,11 @@ Endpoints:
     GET  /metrics       JSON snapshot of server + engine counters.
 
 Model is fixed at startup via --model. To switch, restart the server.
+<<<<<<< Updated upstream
 Pinned to GPU 1 (RTX 3080) via CUDA_VISIBLE_DEVICES with PCI bus ordering.
+=======
+Pinned to GPU 1 (RTX 3080) via CUDA_VISIBLE_DEVICES.
+>>>>>>> Stashed changes
 
 Usage:
     python server.py --model qwen
@@ -18,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 # Must set BEFORE any CUDA-touching import (torch, vllm).
+<<<<<<< Updated upstream
 #
 # CUDA_DEVICE_ORDER=PCI_BUS_ID forces CUDA to index GPUs in the same order
 # nvidia-smi shows them (by PCI slot), instead of CUDA's default "fastest
@@ -26,6 +31,10 @@ from __future__ import annotations
 import os
 os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1")   # RTX 3080
+=======
+import os
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1")
+>>>>>>> Stashed changes
 
 import argparse
 import asyncio
@@ -95,6 +104,7 @@ class HealthResponse(BaseModel):
 
 class ServerState:
     """Mutable singleton holding engine + counters. Accessed from handlers."""
+<<<<<<< Updated upstream
     engine = None                                 # vllm.v1.engine.async_llm.AsyncLLM
     tokenizer = None
     model_spec: Optional[ModelSpec] = None
@@ -104,6 +114,12 @@ class ServerState:
     # can't be imported at module load time (would touch CUDA before env
     # vars apply).
     metrics_capture: Optional[object] = None
+=======
+    engine = None                                 # vllm.AsyncLLMEngine
+    tokenizer = None
+    model_spec: Optional[ModelSpec] = None
+    started_at: float = 0.0
+>>>>>>> Stashed changes
 
     # Cheap counters surfaced via /metrics
     requests_completed: int = 0
@@ -123,6 +139,7 @@ async def init_engine(spec: ModelSpec, gpu_memory_utilization: float) -> None:
     log.info("Initializing vLLM engine: model=%s quant=%s max_len=%d",
              spec.repo_id, spec.quantization, spec.max_model_len)
 
+<<<<<<< Updated upstream
     # Deferred imports keep --help instant and ensure CUDA env vars took effect.
     from vllm import AsyncLLMEngine, AsyncEngineArgs
     from vllm.v1.metrics.loggers import StatLoggerBase
@@ -177,6 +194,10 @@ async def init_engine(spec: ModelSpec, gpu_memory_utilization: float) -> None:
         cap = _MetricsCaptureImpl(vllm_config, engine_index)
         state.metrics_capture = cap
         return cap
+=======
+    # Deferred import keeps --help instant and ensures CUDA_VISIBLE_DEVICES took effect.
+    from vllm import AsyncLLMEngine, AsyncEngineArgs
+>>>>>>> Stashed changes
 
     engine_args = AsyncEngineArgs(
         model=spec.repo_id,
@@ -186,6 +207,7 @@ async def init_engine(spec: ModelSpec, gpu_memory_utilization: float) -> None:
         max_model_len=spec.max_model_len,
         enforce_eager=False,             # use CUDA graphs
         trust_remote_code=False,
+<<<<<<< Updated upstream
     )
 
     state.engine = AsyncLLMEngine.from_engine_args(
@@ -193,6 +215,13 @@ async def init_engine(spec: ModelSpec, gpu_memory_utilization: float) -> None:
         stat_loggers=[_stat_logger_factory],
     )
     state.tokenizer = state.engine.get_tokenizer()
+=======
+        disable_log_requests=True,       # we do our own request logging
+    )
+
+    state.engine = AsyncLLMEngine.from_engine_args(engine_args)
+    state.tokenizer = await state.engine.get_tokenizer()
+>>>>>>> Stashed changes
     state.model_spec = spec
     state.started_at = time.time()
     log.info("Engine ready: %s", spec.repo_id)
@@ -229,6 +258,7 @@ async def health():
 # ---- /metrics --------------------------------------------------------------
 
 def _scheduler_snapshot() -> dict:
+<<<<<<< Updated upstream
     """Read the latest captured scheduler stats from our V1 StatLogger.
 
     Returns roughly the V0 shape where V1 has an analog, plus extras V1
@@ -286,6 +316,30 @@ def _scheduler_snapshot() -> dict:
         "stats_age_seconds": round(age, 3),
         "prefix_cache_stats": prefix_cache_block,
     }
+=======
+    """Best-effort read of vLLM's internal scheduler / block-manager state.
+
+    The internal API path is version-sensitive — wrap defensively so a vLLM
+    upgrade doesn't break the metrics endpoint entirely.
+    """
+    try:
+        sched = state.engine.engine.scheduler[0]  # type: ignore[attr-defined]
+        bm = sched.block_manager
+        total = bm.get_num_total_gpu_blocks()
+        free = bm.get_num_free_gpu_blocks()
+        used = total - free
+        return {
+            "num_running_requests": len(sched.running),
+            "num_waiting_requests": len(sched.waiting),
+            "num_swapped_requests": len(sched.swapped),
+            "gpu_blocks_total": total,
+            "gpu_blocks_used": used,
+            "gpu_blocks_free": free,
+            "gpu_cache_usage_perc": round(100.0 * used / total, 1) if total else 0.0,
+        }
+    except Exception as e:
+        return {"error": f"scheduler stats unavailable: {type(e).__name__}: {e}"}
+>>>>>>> Stashed changes
 
 
 @app.get("/metrics")
@@ -444,14 +498,19 @@ def main() -> int:
     import uvicorn
     log.info("Starting server on %s:%d, model=%s (%s)",
              args.host, args.port, spec.key, spec.repo_id)
+<<<<<<< Updated upstream
     log.info("CUDA_DEVICE_ORDER=%s  CUDA_VISIBLE_DEVICES=%s",
              os.environ.get("CUDA_DEVICE_ORDER"),
              os.environ.get("CUDA_VISIBLE_DEVICES"))
+=======
+    # log_level="info" gives uvicorn its own access logs (one line per request).
+>>>>>>> Stashed changes
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0
 
 
 if __name__ == "__main__":
+<<<<<<< Updated upstream
     raise SystemExit(main())
 
 
@@ -1171,3 +1230,6 @@ if __name__ == "__main__":
 # #
 # # if __name__ == "__main__":
 # #     raise SystemExit(main())
+=======
+    raise SystemExit(main())
+>>>>>>> Stashed changes

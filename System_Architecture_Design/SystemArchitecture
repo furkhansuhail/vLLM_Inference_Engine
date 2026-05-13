@@ -13,7 +13,7 @@ distributed-vllm-demo/
 │   ├── requirements.txt
 │   └── README.md
 ├── setup/
-│   └── prefetch_models.py
+│   └── hardware_sanity_check.py
 ├── docs/
 │   └── architecture.md
 └── README.md
