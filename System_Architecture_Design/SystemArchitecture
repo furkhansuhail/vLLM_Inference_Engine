@@ -1,19 +1,37 @@
-distributed-vllm-demo/
-├── server/                  ← opens as a PyCharm project on CentOS
-│   ├── prefetch_models.py
-│   ├── smoke_test.py
-│   ├── server.py
+vLLM_Inference_Engine/
+├── .dockerignore                       # excludes from docker build context
+├── .gitignore                          # excludes from git
+├── README.md                           # this file
+├── HANDOFF_1.md                        # original design doc (read for rationale)
+│
+├── server/                             # → deployed on CentOS
+│   ├── server.py                       # FastAPI + vLLM AsyncLLM + V1 stat logger
+│   │                                   #   + /admin/load_model endpoint
 │   ├── requirements.txt
-│   └── README.md
-├── client/                  ← opens as a PyCharm project on Windows
-│   ├── telemetry_cli.py
-│   ├── streamlit_app.py
-│   ├── shared/
-│   │   └── protocol.py      ← request/response Pydantic models
-│   ├── requirements.txt
-│   └── README.md
-├── setup/
+│   ├── prefetch_models.py              # one-time HF cache populator
+│   └── smoke_test.py                   # standalone vLLM + GPU verification
+│
+├── client/                             # → deployed on Windows
+│   ├── streamlit_app.py                # dashboard: single-run + compare tabs
+│   ├── inference_client.py             # async SSE client + retry + metrics polling
+│   ├── test_cases.py                   # Case A/B/C prompt definitions
+│   └── client_requirements.txt
+│
+├── setup/                              # → host-side hardware sanity checks
 │   └── hardware_sanity_check.py
-├── docs/
-│   └── architecture.md
-└── README.md
+│
+├── System_Architecture_Design/
+│   └── SystemArchitecture              # architecture diagram source
+│
+├── systemd/                            # operational: native-host deployment
+│   ├── vllm-server.service             # user-level systemd unit
+│   ├── server-wrapper.sh               # exec wrapper (activates venv + runs python)
+│   ├── preflight.sh                    # kills orphan EngineCore processes, checks VRAM
+│   ├── install.sh                      # one-shot installer
+│   └── README.md                       # operations guide
+│
+└── docker/                             # operational: containerized deployment
+    ├── Dockerfile                      # CUDA 13.2 + Python 3.12 + vLLM 0.20.2
+    ├── entrypoint.sh                   # env-var → CLI translation
+    ├── docker-compose.yml              # GPU passthrough + cache volumes + IPC
+    └── README.md                       # build/run/troubleshoot guide
