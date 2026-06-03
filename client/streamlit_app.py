@@ -61,6 +61,35 @@ st.set_page_config(
 
 
 # ============================================================================
+#  SWAP-POLLING GRACE PERIOD
+# ============================================================================
+#
+# When the server processes /admin/load_model, AsyncLLMEngine.from_engine_args
+# blocks the FastAPI event loop synchronously for ~20-30 s while it loads the
+# model. During that window /health requests time out — the server is genuinely
+# unresponsive even though the swap is succeeding in the background.
+#
+# Without intervention the client would (a) show "Cannot reach server" and
+# (b) stop auto-refreshing, so it never notices when the server comes back.
+# The grace period flag below tells the sidebar to keep polling for some
+# time after any swap is initiated, regardless of whether /health is
+# currently reachable.
+
+SWAP_POLL_GRACE_SECONDS = 90.0
+
+
+def _initiate_swap_polling(duration_seconds: float = SWAP_POLL_GRACE_SECONDS) -> None:
+    """Mark a swap as just-initiated. The sidebar uses this to (a) keep
+    auto-refreshing and (b) display a friendly "loading model" status
+    instead of an alarming "cannot reach server" error during the
+    ~20-30 s window when the server's event loop is blocked on
+    AsyncLLMEngine.from_engine_args."""
+    now = time.time()
+    st.session_state.swap_polling_until = now + duration_seconds
+    st.session_state.swap_polling_started_at = now
+
+
+# ============================================================================
 #  SIDEBAR — live model panel + sampling + telemetry settings (shared)
 # ============================================================================
 
@@ -81,8 +110,25 @@ with st.sidebar:
         health_err = f"{type(e).__name__}: {e}"
 
     status_box = st.empty()
+    # Did we recently initiate a swap? If so, a /health timeout is expected,
+    # not an alarm condition — the server's event loop is blocked on
+    # AsyncLLMEngine.from_engine_args for ~20-30 s.
+    swap_grace_period = (
+        st.session_state.get("swap_polling_until", 0.0) > time.time()
+    )
+
     if health_err is not None:
-        status_box.error(f"🔴 Cannot reach server\n\n`{health_err}`")
+        if swap_grace_period:
+            elapsed = time.time() - st.session_state.get(
+                "swap_polling_started_at", time.time()
+            )
+            status_box.warning(
+                f"🟡 **LOADING MODEL** — server initializing\n\n"
+                f"Briefly unreachable while loading (~20-30 s is normal).\n\n"
+                f"Elapsed: {elapsed:.0f} s"
+            )
+        else:
+            status_box.error(f"🔴 Cannot reach server\n\n`{health_err}`")
     else:
         status = health.get("status", "unknown")
         model_key = health.get("model_key")
@@ -138,6 +184,7 @@ with st.sidebar:
                 ):
                     try:
                         asyncio.run(load_model(server_url, target_model))
+                        _initiate_swap_polling()
                         st.rerun()
                     except httpx.HTTPStatusError as e:
                         st.error(f"Swap rejected: HTTP {e.response.status_code}")
@@ -149,8 +196,14 @@ with st.sidebar:
     # Auto-refresh during a server-side swap (whether from compare mode
     # or a manual swap). The actual rerun fires after the sidebar block
     # closes so other widget state is fully captured first.
+    #
+    # We auto-refresh in two situations:
+    #   1. /health says status="swapping" (normal case, server responsive)
+    #   2. We're inside the post-swap grace period (server may be unresponsive
+    #      while AsyncLLMEngine.from_engine_args blocks the event loop)
     auto_refresh_pending = (
-        health is not None and health.get("status") == "swapping"
+        (health is not None and health.get("status") == "swapping")
+        or swap_grace_period
     )
 
     st.divider()
@@ -904,6 +957,7 @@ with tab_compare:
         else:
             try:
                 asyncio.run(load_model(server_url, COMPARE_LEFT_MODEL))
+                _initiate_swap_polling()
                 _set_compare_state("SWAPPING_M1")
             except Exception as e:
                 st.session_state.compare_error = (
@@ -968,6 +1022,7 @@ with tab_compare:
         # Trigger swap to M2.
         try:
             asyncio.run(load_model(server_url, COMPARE_RIGHT_MODEL))
+            _initiate_swap_polling()
             _set_compare_state("SWAPPING_M2")
         except Exception as e:
             st.session_state.compare_error = (
